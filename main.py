@@ -4,7 +4,7 @@
 DACON 2025 전력사용량 예측 - 고급 베이스라인 (argparse 미사용, run() 한 번으로 실행)
 
 개선 포인트
-- 모델: LightGBM -> XGBoost -> HistGradientBoosting -> RandomForest 순 폴백
+- 모델: CatBoost -> LightGBM -> XGBoost -> HistGradientBoosting -> RandomForest 순 폴백
 - 시간 기반 교차검증(TimeSeriesSplit) + early stopping(가능한 모델에 한함)
 - 타깃 log1p 변환 및 역변환
 - 시간 파생(year, month, dow, hour, 주기형 sin/cos), 그룹 래깅/롤링(1, 3, 24)
@@ -14,7 +14,7 @@ DACON 2025 전력사용량 예측 - 고급 베이스라인 (argparse 미사용, 
 필요 패키지(최소)
     pip install pandas numpy scikit-learn
 선택(성능 향상):
-    pip install lightgbm xgboost
+    pip install catboost lightgbm xgboost
 """
 
 import math
@@ -28,6 +28,12 @@ import numpy as np
 import pandas as pd
 
 # 우선 순위 모델 임포트(없는 경우 폴백)
+try:
+    from catboost import CatBoostRegressor
+    _HAS_CAT = True
+except Exception:
+    _HAS_CAT = False
+
 try:
     from lightgbm import LGBMRegressor
     _HAS_LGBM = True
@@ -323,8 +329,10 @@ def _ensure_submission(sample: pd.DataFrame, test: pd.DataFrame, preds: np.ndarr
 def _choose_model():
     """
     사용 가능 모델을 선택한다.
-    우선순위: LightGBM -> XGBoost -> HistGBR -> RandomForest
+    우선순위: CatBoost -> LightGBM -> XGBoost -> HistGBR -> RandomForest
     """
+    if _HAS_CAT:
+        return "cat"
     if _HAS_LGBM:
         return "lgbm"
     if _HAS_XGB:
@@ -359,7 +367,24 @@ def _fit_predict_cv(X: pd.DataFrame, y: np.ndarray, X_test: pd.DataFrame, time_i
         X_tr_f, X_va_f = X_ord.iloc[tr_idx], X_ord.iloc[va_idx]
         y_tr_f, y_va_f = y_ord[tr_idx], y_ord[va_idx]
 
-        if model_name == "lgbm":
+        if model_name == "cat":
+            model = CatBoostRegressor(
+                iterations=5000, learning_rate=0.03, depth=8,
+                subsample=0.9, colsample_bylevel=0.9, l2_leaf_reg=1.0,
+                loss_function="MAE", random_seed=42, verbose=False
+            )
+            model.fit(
+                X_tr_f, y_tr_f,
+                eval_set=(X_va_f, y_va_f),
+                use_best_model=True,
+                early_stopping_rounds=100,
+                verbose=False
+            )
+            pred_va = model.predict(X_va_f)
+            pred_te = model.predict(X_test)
+            best_iter = getattr(model, "get_best_iteration", lambda: None)()
+
+        elif model_name == "lgbm":
             model = LGBMRegressor(
                 n_estimators=5000, learning_rate=0.03, num_leaves=64,
                 subsample=0.9, colsample_bytree=0.9, reg_lambda=1.0,
@@ -393,6 +418,7 @@ def _fit_predict_cv(X: pd.DataFrame, y: np.ndarray, X_test: pd.DataFrame, time_i
             best_ntree = getattr(model, "best_ntree_limit", None)
             pred_va = model.predict(X_va_f, iteration_range=(0, best_ntree)) if best_ntree else model.predict(X_va_f)
             pred_te = model.predict(X_test,  iteration_range=(0, best_ntree)) if best_ntree else model.predict(X_test)
+            best_iter = best_ntree
 
         else:
             # HistGradientBoostingRegressor(빠름, 기본값 좋음) 폴백
@@ -404,6 +430,7 @@ def _fit_predict_cv(X: pd.DataFrame, y: np.ndarray, X_test: pd.DataFrame, time_i
                 model.fit(X_tr_f, y_tr_f)
                 pred_va = model.predict(X_va_f)
                 pred_te = model.predict(X_test)
+                best_iter = None
             except Exception:
                 # 최후의 폴백: RandomForest
                 model = RandomForestRegressor(
@@ -413,10 +440,14 @@ def _fit_predict_cv(X: pd.DataFrame, y: np.ndarray, X_test: pd.DataFrame, time_i
                 model.fit(X_tr_f, y_tr_f)
                 pred_va = model.predict(X_va_f)
                 pred_te = model.predict(X_test)
+                best_iter = None
 
         oof[va_idx] = pred_va
         preds_test_folds.append(pred_te)
-        best_iters.append(len(getattr(model, "evals_result_", {})) if hasattr(model, "evals_result_") else None)
+        if best_iter is not None:
+            best_iters.append(best_iter)
+        else:
+            best_iters.append(len(getattr(model, "evals_result_", {})) if hasattr(model, "evals_result_") else None)
 
         mae = mean_absolute_error(np.expm1(y_va_f), np.expm1(pred_va))
         print(f"[CV] fold={fold} MAE={mae:.6f}")
